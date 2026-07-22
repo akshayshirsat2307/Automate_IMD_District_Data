@@ -1,28 +1,36 @@
-# -----------------------------------------------------------------------------
-# Example GitHub Actions workflow (save as .github/workflows/imd_rainfall.yml)
-# to run this automatically every day:
-#
-# name: IMD Daily Rainfall Update
-# on:
-#   schedule:
-#     - cron: "30 3 * * *"   # ~9:00 AM IST daily; adjust as needed
-#   workflow_dispatch: {}
-#
-# jobs:
-#   update:
-#     runs-on: ubuntu-latest
-#     steps:
-#       - uses: actions/checkout@v4
-#       - uses: actions/setup-python@v5
-#         with:
-#           python-version: "3.11"
-#       - run: pip install requests pdfplumber pandas
-#       - run: python imd_rainfall_update.py --main-csv master.csv --out-dir output
-#       - name: Commit output
-#         run: |
-#           git config user.name "github-actions[bot]"
-#           git config user.email "github-actions[bot]@users.noreply.github.com"
-#           git add output/
-#           git commit -m "Daily IMD rainfall update $(date +'%Y-%m-%d')" || echo "No changes"
-#           git push
-# -----------------------------------------------------------------------------
+name: IMD Daily Rainfall Update
+
+on:
+  schedule:
+    # Runs at 03:30 UTC = ~09:00 AM IST daily. Adjust as needed.
+    - cron: "30 3 * * *"
+  workflow_dispatch: {}   # allows manual trigger from the Actions tab
+
+permissions:
+  contents: write   # needed so the workflow can commit the output CSV back
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests pdfplumber pandas
+
+      - name: Run IMD rainfall update script
+        run: python download_imd_district_daily.py --main-csv master.csv --out-dir output
+
+      - name: Commit and push output
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add output/
+          git commit -m "Daily IMD rainfall update $(date +'%Y-%m-%d')" || echo "No changes to commit"
+          git push
