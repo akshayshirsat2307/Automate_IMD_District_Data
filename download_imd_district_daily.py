@@ -1,35 +1,37 @@
+```python
 #!/usr/bin/env python3
+
 """
-IMD District Rainfall Downloader & Merger
-==========================================
+IMD District Rainfall Downloader -> PDF -> Converted CSV -> Master CSV
 
-What this does, every time you run it:
-  1. Downloads the latest "District Rainfall Distribution (Daily & Cumulative)"
-     PDF published by IMD (same URL every day -> content updates in place):
-     https://mausam.imd.gov.in/Rainfall/DISTRICT_RAINFALL_DISTRIBUTION_COUNTRY_INDIA_cd.pdf
-  2. Parses the PDF text into structured rows (State + District level).
-  3. Merges those rows onto your master CSV (columns: State, District, Lat, Lon)
-     by matching State + District names (case/whitespace-insensitive).
-  4. Writes a dated output CSV, e.g. output/rainfall_2026-07-22.csv
-     (the date used is the "DAY:" date printed inside the PDF itself, so the
-     filename reflects the data date, not just whenever the script happened to run).
+Workflow
+--------
+1. Download latest IMD District Rainfall Distribution PDF
+2. Save the original PDF
+3. Extract district-level rainfall data from ALL PDF pages
+4. Save extracted data as converted CSV
+5. Match State + District with master CSV
+6. Use exact normalized matching first
+7. Use fuzzy matching for remaining unmatched districts
+8. Save final master CSV with rainfall data
+9. Save unmatched records for quality checking
 
-Final CSV columns:
-  State, District, Lat, Lon, Actual, Normal, Dept, Category,
-  Cumulative_Actual, Cumulative_Normal, Cumulative_Dept, Cumulative_Category
+Required master CSV columns:
+    State
+    District
+    Lat
+    Lon
 
-Usage:
-  python imd_rainfall_update.py --main-csv master.csv --out-dir output
+Install:
+    pip install requests pdfplumber pandas rapidfuzz
 
-Designed to run unattended in GitHub Actions (see the workflow YAML at the
-bottom of this file, in the comment block) — no manual input needed.
-
-Dependencies:
-  pip install requests pdfplumber pandas
+Run:
+    python imd_rainfall_update.py \
+        --main-csv master.csv \
+        --out-dir output
 """
 
 import argparse
-import io
 import os
 import re
 import sys
@@ -37,246 +39,1017 @@ from datetime import datetime
 
 import pandas as pd
 import requests
+import pdfplumber
 
 try:
-    import pdfplumber
+    from rapidfuzz import process, fuzz
 except ImportError:
-    print("Missing dependency 'pdfplumber'. Install with: pip install pdfplumber", file=sys.stderr)
-    raise
+    print("Please install rapidfuzz:")
+    print("pip install rapidfuzz")
+    sys.exit(1)
 
-PDF_URL = "https://mausam.imd.gov.in/Rainfall/DISTRICT_RAINFALL_DISTRIBUTION_COUNTRY_INDIA_cd.pdf"
 
-NUM_RE = re.compile(r"^-?\d+(\.\d+)?$")
-DAY_RE = re.compile(r"DAY:\s*(\d{2})-(\d{2})-(\d{4})")
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-SKIP_PREFIXES = (
-    "India Meteorological Department",
-    "Hydromet Division",
-    "DISTRICT RAINFALL DISTRIBUTION",
-    "DAY:",
-    "S.No",
-    "LEGEND",
-    "CATEGORY",
-    "Note :",
-    "Large Excess",
-    "Excess (",
-    "Normal (",
-    "Deficient (",
-    "Large Deficient",
-    "No Rain",
-    "Not Available",
+PDF_URL = (
+    "https://mausam.imd.gov.in/Rainfall/"
+    "DISTRICT_RAINFALL_DISTRIBUTION_COUNTRY_INDIA_cd.pdf"
 )
 
-
-def download_pdf(url: str, dest_path: str) -> str:
-    """Download the PDF to dest_path. Raises on HTTP error."""
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; IMDRainfallBot/1.0)"}
-    resp = requests.get(url, headers=headers, timeout=60)
-    resp.raise_for_status()
-    with open(dest_path, "wb") as f:
-        f.write(resp.content)
-    return dest_path
+FUZZY_THRESHOLD = 85
 
 
-def extract_data_date(first_page_text: str) -> str:
-    """Pull the 'DAY: DD-MM-YYYY' date out of the PDF and return YYYY-MM-DD."""
-    m = DAY_RE.search(first_page_text or "")
-    if m:
-        dd, mm, yyyy = m.groups()
-        return f"{yyyy}-{mm}-{dd}"
-    return datetime.utcnow().strftime("%Y-%m-%d")
+# ============================================================
+# DOWNLOAD PDF
+# ============================================================
+
+def download_pdf(url, output_path):
+
+    print("\nDownloading IMD PDF...")
+    print(url)
+
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    response = requests.get(
+        url,
+        headers=headers,
+        timeout=120
+    )
+
+    response.raise_for_status()
+
+    with open(output_path, "wb") as f:
+        f.write(response.content)
+
+    print("PDF saved:")
+    print(output_path)
+
+    return output_path
 
 
-def split_name_and_values(line: str):
-    """
-    Split a data line into (name, value_tokens).
-    The name is everything before the first token that is a plain number
-    or the literal 'ND'. Returns (None, None) if no such token exists
-    (i.e. the line isn't a data row at all -- header/footer/legend text).
-    """
-    tokens = line.split()
-    for i, tok in enumerate(tokens):
-        if tok == "ND" or NUM_RE.match(tok):
-            name = " ".join(tokens[:i]).strip()
-            if not name:
-                return None, None
-            return name, tokens[i:]
-    return None, None
+# ============================================================
+# NORMALIZE TEXT
+# ============================================================
+
+def normalize_text(value):
+
+    if pd.isna(value):
+        return ""
+
+    value = str(value).upper().strip()
+
+    # Replace & with AND
+    value = value.replace("&", " AND ")
+
+    # Common abbreviations
+    replacements = {
+        "DIST.": "DISTRICT",
+        "DIST": "DISTRICT",
+        "DISTS": "DISTRICTS",
+        "ST.": "SAINT",
+        "ST ": "SAINT ",
+    }
+
+    for old, new in replacements.items():
+        value = value.replace(old, new)
+
+    # Remove punctuation
+    value = re.sub(r"[^A-Z0-9\s]", " ", value)
+
+    # Remove repeated spaces
+    value = re.sub(r"\s+", " ", value).strip()
+
+    return value
 
 
-def parse_block(tokens, idx):
-    """
-    Parse one ACTUAL/NORMAL/%DEP/CAT block starting at tokens[idx].
-    If NORMAL == 'ND', the %DEP and CAT fields are absent in the source
-    (IMD simply omits them), so we only consume ACTUAL + 'ND'.
-    Returns (dict, new_idx).
-    """
-    actual = tokens[idx]
-    idx += 1
-    normal = tokens[idx]
-    idx += 1
-    if normal == "ND":
-        return {"actual": _to_num(actual), "normal": None, "dep": None, "cat": None}, idx
-    dep = tokens[idx]
-    idx += 1
-    cat = tokens[idx]
-    idx += 1
-    return {"actual": _to_num(actual), "normal": _to_num(normal), "dep": _to_num(dep), "cat": cat}, idx
+# ============================================================
+# EXTRACT DATE
+# ============================================================
+
+def extract_data_date(text):
+
+    patterns = [
+        r"DAY\s*:\s*(\d{2})-(\d{2})-(\d{4})",
+        r"DAY\s*:\s*(\d{2})/(\d{2})/(\d{4})",
+        r"DATE\s*:\s*(\d{2})-(\d{2})-(\d{4})",
+        r"DATE\s*:\s*(\d{2})/(\d{2})/(\d{4})",
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(pattern, text, re.IGNORECASE)
+
+        if match:
+
+            dd, mm, yyyy = match.groups()
+
+            return f"{yyyy}-{mm}-{dd}"
+
+    return datetime.now().strftime("%Y-%m-%d")
 
 
-def _to_num(s):
+# ============================================================
+# NUMBER CHECK
+# ============================================================
+
+def is_number(value):
+
+    if value == "ND":
+        return True
+
     try:
-        return float(s)
-    except (TypeError, ValueError):
+        float(value)
+        return True
+    except:
+        return False
+
+
+# ============================================================
+# CONVERT NUMBER
+# ============================================================
+
+def convert_number(value):
+
+    if value is None:
+        return None
+
+    if str(value).upper() == "ND":
+        return None
+
+    try:
+        return float(value)
+    except:
         return None
 
 
-def parse_pdf(pdf_path: str):
-    """
-    Parse the IMD district rainfall PDF.
-    Returns (data_date_str, list_of_row_dicts).
-    Each row dict: State, District (None for state/subdivision summary rows),
-    Actual, Normal, Dept, Category, Cumulative_Actual, Cumulative_Normal,
-    Cumulative_Dept, Cumulative_Category, IsState (bool)
-    """
+# ============================================================
+# PARSE RAINFALL BLOCK
+# ============================================================
+
+def parse_block(values, index):
+
+    if index >= len(values):
+        raise IndexError
+
+    actual = values[index]
+    index += 1
+
+    if index >= len(values):
+        raise IndexError
+
+    normal = values[index]
+    index += 1
+
+    # When Normal is ND,
+    # IMD does not provide departure/category
+    if normal == "ND":
+
+        return {
+            "Actual": convert_number(actual),
+            "Normal": None,
+            "Dept": None,
+            "Category": None
+        }, index
+
+    if index + 1 >= len(values):
+        raise IndexError
+
+    dept = values[index]
+    index += 1
+
+    category = values[index]
+    index += 1
+
+    return {
+        "Actual": convert_number(actual),
+        "Normal": convert_number(normal),
+        "Dept": convert_number(dept),
+        "Category": category
+    }, index
+
+
+# ============================================================
+# FIND NAME + NUMERIC DATA
+# ============================================================
+
+def split_name_and_values(line):
+
+    tokens = line.split()
+
+    for i, token in enumerate(tokens):
+
+        if is_number(token):
+
+            name = " ".join(tokens[:i]).strip()
+
+            if name:
+
+                return name, tokens[i:]
+
+    return None, None
+
+
+# ============================================================
+# PARSE PDF
+# ============================================================
+
+def parse_pdf(pdf_path):
+
     rows = []
+
     current_state = None
     data_date = None
 
+    print("\nReading PDF...")
+
     with pdfplumber.open(pdf_path) as pdf:
-        for page_num, page in enumerate(pdf.pages):
-            text = page.extract_text() or ""
-            if page_num == 0:
+
+        print("Total pages:", len(pdf.pages))
+
+        for page_number, page in enumerate(pdf.pages, start=1):
+
+            print(
+                f"Processing page {page_number}/{len(pdf.pages)}"
+            )
+
+            text = page.extract_text(
+                x_tolerance=2,
+                y_tolerance=3
+            ) or ""
+
+            if not text:
+                continue
+
+            if data_date is None:
+
                 data_date = extract_data_date(text)
 
-            for raw_line in text.split("\n"):
+            lines = text.split("\n")
+
+            for raw_line in lines:
+
                 line = raw_line.strip()
+
                 if not line:
                     continue
-                if any(line.startswith(p) for p in SKIP_PREFIXES):
+
+                # Skip common headers
+                skip_words = [
+                    "INDIA METEOROLOGICAL DEPARTMENT",
+                    "HYDROMET DIVISION",
+                    "DISTRICT RAINFALL DISTRIBUTION",
+                    "DAY:",
+                    "S.NO",
+                    "LEGEND",
+                    "CATEGORY",
+                    "NOTE :",
+                    "LARGE EXCESS",
+                    "EXCESS",
+                    "NORMAL",
+                    "DEFICIENT",
+                    "LARGE DEFICIENT",
+                    "NO RAIN",
+                    "NOT AVAILABLE"
+                ]
+
+                if any(
+                    line.upper().startswith(word)
+                    for word in skip_words
+                ):
                     continue
 
-                m = re.match(r"^(\d+)\s+(.*)$", line)
-                if m:
-                    # District-level row: "<S.No> <District Name> <values...>"
-                    rest = m.group(2)
-                    name, values = split_name_and_values(rest)
-                    if name is None or len(values) < 4:
+                # ==================================================
+                # DISTRICT ROW
+                # ==================================================
+
+                match = re.match(
+                    r"^(\d+)\s+(.*)$",
+                    line
+                )
+
+                if match:
+
+                    serial_number = match.group(1)
+
+                    rest = match.group(2)
+
+                    name, values = (
+                        split_name_and_values(rest)
+                    )
+
+                    if not name:
                         continue
+
+                    if not values:
+                        continue
+
                     try:
-                        daily, idx = parse_block(values, 0)
-                        cum, _ = parse_block(values, idx)
-                    except IndexError:
+
+                        daily, index = parse_block(
+                            values,
+                            0
+                        )
+
+                        cumulative, _ = parse_block(
+                            values,
+                            index
+                        )
+
+                    except Exception:
+
                         continue
+
+                    if current_state is None:
+                        current_state = ""
+
                     rows.append({
-                        "State": current_state,
-                        "District": name,
-                        "Actual": daily["actual"], "Normal": daily["normal"],
-                        "Dept": daily["dep"], "Category": daily["cat"],
-                        "Cumulative_Actual": cum["actual"], "Cumulative_Normal": cum["normal"],
-                        "Cumulative_Dept": cum["dep"], "Cumulative_Category": cum["cat"],
-                        "IsState": False,
+
+                        "State":
+                            current_state,
+
+                        "District":
+                            name,
+
+                        "Actual":
+                            daily["Actual"],
+
+                        "Normal":
+                            daily["Normal"],
+
+                        "Dept":
+                            daily["Dept"],
+
+                        "Category":
+                            daily["Category"],
+
+                        "Cumulative_Actual":
+                            cumulative["Actual"],
+
+                        "Cumulative_Normal":
+                            cumulative["Normal"],
+
+                        "Cumulative_Dept":
+                            cumulative["Dept"],
+
+                        "Cumulative_Category":
+                            cumulative["Category"],
+
+                        "Source_Page":
+                            page_number,
+
+                        "SNo":
+                            serial_number,
+
+                        "Data_Date":
+                            data_date
+
                     })
-                else:
-                    # State / subdivision summary row (no S.No)
-                    name, values = split_name_and_values(line)
-                    if name is None or len(values) < 4:
-                        continue
-                    try:
-                        daily, idx = parse_block(values, 0)
-                        cum, _ = parse_block(values, idx)
-                    except IndexError:
-                        continue
-                    current_state = name  # districts that follow belong to this state
-                    rows.append({
-                        "State": name,
-                        "District": None,
-                        "Actual": daily["actual"], "Normal": daily["normal"],
-                        "Dept": daily["dep"], "Category": daily["cat"],
-                        "Cumulative_Actual": cum["actual"], "Cumulative_Normal": cum["normal"],
-                        "Cumulative_Dept": cum["dep"], "Cumulative_Category": cum["cat"],
-                        "IsState": True,
-                    })
 
-    return data_date, rows
+                    continue
+
+                # ==================================================
+                # STATE ROW
+                # ==================================================
+
+                name, values = (
+                    split_name_and_values(line)
+                )
+
+                if not name:
+                    continue
+
+                if not values:
+                    continue
+
+                try:
+
+                    daily, index = parse_block(
+                        values,
+                        0
+                    )
+
+                    cumulative, _ = parse_block(
+                        values,
+                        index
+                    )
+
+                except Exception:
+
+                    continue
+
+                # A line with rainfall values and no S.No
+                # is treated as a state/subdivision heading
+
+                current_state = name
+
+    df = pd.DataFrame(rows)
+
+    if df.empty:
+
+        raise RuntimeError(
+            "No district rainfall data was extracted from PDF."
+        )
+
+    # Remove possible duplicate records
+    df = df.drop_duplicates(
+        subset=[
+            "State",
+            "District"
+        ],
+        keep="last"
+    )
+
+    print(
+        f"\nExtracted {len(df)} records from PDF."
+    )
+
+    return data_date, df
 
 
-def normalize(s):
-    if s is None:
-        return ""
-    return re.sub(r"\s+", " ", str(s)).strip().upper()
+# ============================================================
+# CREATE STATE + DISTRICT KEY
+# ============================================================
+
+def create_key(state, district):
+
+    return (
+        normalize_text(state)
+        + "|||"
+        + normalize_text(district)
+    )
 
 
-def merge_with_master(master_csv: str, rows: list) -> pd.DataFrame:
-    """Merge parsed district rows onto the master State/District/Lat/Lon CSV."""
-    master = pd.read_csv(master_csv)
-    required = {"State", "District", "Lat", "Lon"}
-    missing = required - set(master.columns)
+# ============================================================
+# FUZZY MATCH
+# ============================================================
+
+def fuzzy_match(
+    master_state,
+    master_district,
+    converted_df
+):
+
+    state_norm = normalize_text(
+        master_state
+    )
+
+    district_norm = normalize_text(
+        master_district
+    )
+
+    # First restrict to same state
+    state_rows = converted_df[
+        converted_df["_State_Normalized"]
+        == state_norm
+    ]
+
+    if state_rows.empty:
+
+        return None, 0
+
+    choices = (
+        state_rows["_District_Normalized"]
+        .dropna()
+        .unique()
+        .tolist()
+    )
+
+    if not choices:
+
+        return None, 0
+
+    result = process.extractOne(
+        district_norm,
+        choices,
+        scorer=fuzz.token_sort_ratio
+    )
+
+    if result is None:
+
+        return None, 0
+
+    matched_name = result[0]
+
+    score = result[1]
+
+    if score >= FUZZY_THRESHOLD:
+
+        return matched_name, score
+
+    return None, score
+
+
+# ============================================================
+# MERGE WITH MASTER
+# ============================================================
+
+def merge_with_master(
+    master_csv,
+    converted_csv,
+    output_csv,
+    unmatched_csv
+):
+
+    print("\nReading master CSV...")
+
+    master = pd.read_csv(
+        master_csv,
+        dtype=str
+    )
+
+    print(
+        "Master records:",
+        len(master)
+    )
+
+    required_columns = [
+        "State",
+        "District",
+        "Lat",
+        "Lon"
+    ]
+
+    missing = [
+        col
+        for col in required_columns
+        if col not in master.columns
+    ]
+
     if missing:
-        raise ValueError(f"Main CSV is missing required columns: {missing}")
 
-    district_rows = [r for r in rows if not r["IsState"]]
-    lookup = {}
-    for r in district_rows:
-        key = (normalize(r["State"]), normalize(r["District"]))
-        lookup[key] = r
+        raise ValueError(
+            f"Master CSV missing columns: {missing}"
+        )
 
-    out_cols = ["Actual", "Normal", "Dept", "Category",
-                "Cumulative_Actual", "Cumulative_Normal", "Cumulative_Dept", "Cumulative_Category"]
+    print("\nReading converted CSV...")
 
-    matched = {c: [] for c in out_cols}
-    unmatched = []
-    for _, row in master.iterrows():
-        key = (normalize(row["State"]), normalize(row["District"]))
-        data = lookup.get(key)
-        if data is None:
-            unmatched.append((row["State"], row["District"]))
-        for c in out_cols:
-            matched[c].append(data[c] if data else None)
+    rainfall = pd.read_csv(
+        converted_csv,
+        dtype=str
+    )
+
+    print(
+        "Converted rainfall records:",
+        len(rainfall)
+    )
+
+    # Normalize fields
+    master["_State_Normalized"] = (
+        master["State"]
+        .apply(normalize_text)
+    )
+
+    master["_District_Normalized"] = (
+        master["District"]
+        .apply(normalize_text)
+    )
+
+    rainfall["_State_Normalized"] = (
+        rainfall["State"]
+        .apply(normalize_text)
+    )
+
+    rainfall["_District_Normalized"] = (
+        rainfall["District"]
+        .apply(normalize_text)
+    )
+
+    # ========================================================
+    # EXACT MATCH
+    # ========================================================
+
+    rainfall["Match_Key"] = (
+        rainfall["_State_Normalized"]
+        + "|||"
+        + rainfall["_District_Normalized"]
+    )
+
+    master["Match_Key"] = (
+        master["_State_Normalized"]
+        + "|||"
+        + master["_District_Normalized"]
+    )
+
+    # Remove duplicate rainfall keys
+    rainfall_lookup = (
+        rainfall
+        .drop_duplicates(
+            subset=["Match_Key"],
+            keep="last"
+        )
+        .set_index("Match_Key")
+    )
+
+    rainfall_columns = [
+
+        "Actual",
+        "Normal",
+        "Dept",
+        "Category",
+
+        "Cumulative_Actual",
+        "Cumulative_Normal",
+        "Cumulative_Dept",
+        "Cumulative_Category",
+
+        "Source_Page",
+        "SNo",
+        "Data_Date"
+
+    ]
+
+    # ========================================================
+    # EXACT MERGE
+    # ========================================================
 
     result = master.copy()
-    for c in out_cols:
-        result[c] = matched[c]
 
-    if unmatched:
-        print(f"Warning: {len(unmatched)} (State, District) rows in the main CSV had no "
-              f"match in today's IMD PDF. First few: {unmatched[:10]}", file=sys.stderr)
+    for column in rainfall_columns:
+
+        if column in rainfall_lookup.columns:
+
+            result[column] = (
+                result["Match_Key"]
+                .map(
+                    rainfall_lookup[column]
+                )
+            )
+
+        else:
+
+            result[column] = None
+
+    result["Match_Type"] = ""
+
+    result["Match_Score"] = None
+
+    exact_mask = (
+        result["Actual"].notna()
+        | result["Normal"].notna()
+        | result["Category"].notna()
+    )
+
+    result.loc[
+        exact_mask,
+        "Match_Type"
+    ] = "EXACT"
+
+    result.loc[
+        exact_mask,
+        "Match_Score"
+    ] = 100
+
+    # ========================================================
+    # FUZZY MATCH UNMATCHED
+    # ========================================================
+
+    unmatched_indices = result[
+        ~exact_mask
+    ].index
+
+    print(
+        "\nExact matches:",
+        exact_mask.sum()
+    )
+
+    print(
+        "Unmatched before fuzzy matching:",
+        len(unmatched_indices)
+    )
+
+    for index in unmatched_indices:
+
+        master_state = result.loc[
+            index,
+            "State"
+        ]
+
+        master_district = result.loc[
+            index,
+            "District"
+        ]
+
+        matched_district, score = fuzzy_match(
+
+            master_state,
+
+            master_district,
+
+            rainfall
+
+        )
+
+        if matched_district is None:
+
+            continue
+
+        state_norm = normalize_text(
+            master_state
+        )
+
+        match_rows = rainfall[
+            (
+                rainfall["_State_Normalized"]
+                == state_norm
+            )
+            &
+            (
+                rainfall["_District_Normalized"]
+                == matched_district
+            )
+        ]
+
+        if match_rows.empty:
+
+            continue
+
+        matched_row = match_rows.iloc[0]
+
+        for column in rainfall_columns:
+
+            if column in matched_row:
+
+                result.loc[
+                    index,
+                    column
+                ] = matched_row[column]
+
+        result.loc[
+            index,
+            "Match_Type"
+        ] = "FUZZY"
+
+        result.loc[
+            index,
+            "Match_Score"
+        ] = round(
+            score,
+            2
+        )
+
+    # ========================================================
+    # FINAL STATUS
+    # ========================================================
+
+    final_matched = (
+        result["Match_Type"]
+        != ""
+    )
+
+    result.loc[
+        ~final_matched,
+        "Match_Type"
+    ] = "UNMATCHED"
+
+    # ========================================================
+    # REMOVE INTERNAL COLUMNS
+    # ========================================================
+
+    internal_columns = [
+
+        "_State_Normalized",
+        "_District_Normalized",
+        "Match_Key"
+
+    ]
+
+    result = result.drop(
+        columns=internal_columns,
+        errors="ignore"
+    )
+
+    # ========================================================
+    # SAVE FINAL MASTER
+    # ========================================================
+
+    result.to_csv(
+        output_csv,
+        index=False
+    )
+
+    print(
+        "\nFinal master CSV saved:"
+    )
+
+    print(
+        output_csv
+    )
+
+    print(
+        "\nMatch summary:"
+    )
+
+    print(
+        result["Match_Type"]
+        .value_counts()
+    )
+
+    # ========================================================
+    # SAVE UNMATCHED
+    # ========================================================
+
+    unmatched = result[
+        result["Match_Type"]
+        == "UNMATCHED"
+    ].copy()
+
+    unmatched.to_csv(
+        unmatched_csv,
+        index=False
+    )
+
+    print(
+        "\nUnmatched CSV saved:"
+    )
+
+    print(
+        unmatched_csv
+    )
 
     return result
 
 
+# ============================================================
+# MAIN
+# ============================================================
+
 def main():
-    ap = argparse.ArgumentParser(description="Download & merge today's IMD district rainfall data.")
-    ap.add_argument("--main-csv", default="master.csv",
-                    help="Path to your master CSV with columns: State, District, Lat, Lon")
-    ap.add_argument("--out-dir", default="output", help="Directory to write the dated output CSV into")
-    ap.add_argument("--keep-pdf", action="store_true", help="Keep the downloaded PDF instead of deleting it")
-    args = ap.parse_args()
 
-    os.makedirs(args.out_dir, exist_ok=True)
-    pdf_path = os.path.join(args.out_dir, "_imd_rainfall_latest.pdf")
+    parser = argparse.ArgumentParser()
 
-    print(f"Downloading PDF from {PDF_URL} ...")
-    download_pdf(PDF_URL, pdf_path)
+    parser.add_argument(
+        "--main-csv",
+        required=True,
+        help="Master CSV containing State, District, Lat, Lon"
+    )
 
-    print("Parsing PDF ...")
-    data_date, rows = parse_pdf(pdf_path)
-    print(f"Parsed {len(rows)} rows (data date: {data_date}).")
+    parser.add_argument(
+        "--out-dir",
+        default="output",
+        help="Output directory"
+    )
 
-    print(f"Merging with master CSV: {args.main_csv}")
-    result = merge_with_master(args.main_csv, rows)
+    args = parser.parse_args()
 
-    out_path = os.path.join(args.out_dir, f"rainfall_{data_date}.csv")
-    result.to_csv(out_path, index=False)
-    print(f"Wrote: {out_path}")
+    os.makedirs(
+        args.out_dir,
+        exist_ok=True
+    )
 
-    if not args.keep_pdf:
-        try:
-            os.remove(pdf_path)
-        except OSError:
-            pass
+    # ========================================================
+    # STEP 1: TEMP PDF
+    # ========================================================
 
+    temp_pdf = os.path.join(
+        args.out_dir,
+        "imd_rainfall_latest.pdf"
+    )
+
+    # ========================================================
+    # STEP 2: DOWNLOAD PDF
+    # ========================================================
+
+    download_pdf(
+        PDF_URL,
+        temp_pdf
+    )
+
+    # ========================================================
+    # STEP 3: PARSE PDF
+    # ========================================================
+
+    data_date, rainfall_df = parse_pdf(
+        temp_pdf
+    )
+
+    print(
+        "\nIMD data date:",
+        data_date
+    )
+
+    # ========================================================
+    # STEP 4: SAVE CONVERTED CSV
+    # ========================================================
+
+    converted_csv = os.path.join(
+
+        args.out_dir,
+
+        f"IMD_Rainfall_Converted_{data_date}.csv"
+
+    )
+
+    rainfall_df.to_csv(
+        converted_csv,
+        index=False
+    )
+
+    print(
+        "\nConverted CSV saved:"
+    )
+
+    print(
+        converted_csv
+    )
+
+    # ========================================================
+    # STEP 5: FINAL MASTER CSV
+    # ========================================================
+
+    master_output = os.path.join(
+
+        args.out_dir,
+
+        f"IMD_Rainfall_Master_{data_date}.csv"
+
+    )
+
+    # ========================================================
+    # STEP 6: UNMATCHED CSV
+    # ========================================================
+
+    unmatched_output = os.path.join(
+
+        args.out_dir,
+
+        f"IMD_Rainfall_Unmatched_{data_date}.csv"
+
+    )
+
+    # ========================================================
+    # STEP 7: MERGE
+    # ========================================================
+
+    merge_with_master(
+
+        master_csv=args.main_csv,
+
+        converted_csv=converted_csv,
+
+        output_csv=master_output,
+
+        unmatched_csv=unmatched_output
+
+    )
+
+    print(
+        "\n======================================"
+    )
+
+    print(
+        "PROCESS COMPLETED SUCCESSFULLY"
+    )
+
+    print(
+        "======================================"
+    )
+
+    print(
+        "\nFiles created:"
+    )
+
+    print(
+        "1. PDF:"
+    )
+
+    print(
+        temp_pdf
+    )
+
+    print(
+        "\n2. Converted CSV:"
+    )
+
+    print(
+        converted_csv
+    )
+
+    print(
+        "\n3. Final Master CSV:"
+    )
+
+    print(
+        master_output
+    )
+
+    print(
+        "\n4. Unmatched CSV:"
+    )
+
+    print(
+        unmatched_output
+    )
+
+
+# ============================================================
+# RUN
+# ============================================================
 
 if __name__ == "__main__":
-    main()
 
+    main()
+```
