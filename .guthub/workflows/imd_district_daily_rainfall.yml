@@ -1,0 +1,28 @@
+# -----------------------------------------------------------------------------
+# Example GitHub Actions workflow (save as .github/workflows/imd_rainfall.yml)
+# to run this automatically every day:
+#
+# name: IMD Daily Rainfall Update
+# on:
+#   schedule:
+#     - cron: "30 3 * * *"   # ~9:00 AM IST daily; adjust as needed
+#   workflow_dispatch: {}
+#
+# jobs:
+#   update:
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v4
+#       - uses: actions/setup-python@v5
+#         with:
+#           python-version: "3.11"
+#       - run: pip install requests pdfplumber pandas
+#       - run: python imd_rainfall_update.py --main-csv master.csv --out-dir output
+#       - name: Commit output
+#         run: |
+#           git config user.name "github-actions[bot]"
+#           git config user.email "github-actions[bot]@users.noreply.github.com"
+#           git add output/
+#           git commit -m "Daily IMD rainfall update $(date +'%Y-%m-%d')" || echo "No changes"
+#           git push
+# -----------------------------------------------------------------------------
