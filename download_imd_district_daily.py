@@ -1,99 +1,105 @@
 
-
-#!/usr/bin/env python3
-
-"""
-IMD District Rainfall Downloader -> PDF -> Converted CSV -> Master CSV
-
-Workflow
---------
-1. Download latest IMD District Rainfall Distribution PDF
-2. Save the original PDF
-3. Extract district-level rainfall data from ALL PDF pages
-4. Save extracted data as converted CSV
-5. Match State + District with master CSV
-6. Use exact normalized matching first
-7. Use fuzzy matching for remaining unmatched districts
-8. Save final master CSV with rainfall data
-9. Save unmatched records for quality checking
-
-Required master CSV columns:
-    State
-    District
-    Lat
-    Lon
-
-Install:
-    pip install requests pdfplumber pandas rapidfuzz
-
-Run:
-    python imd_rainfall_update.py \
-        --main-csv master.csv \
-        --out-dir output
-"""
-
-import argparse
-import os
+from pathlib import Path
+from datetime import datetime, timedelta
+from urllib.parse import urljoin
 import re
-import sys
-from datetime import datetime
+import unicodedata
 
+import camelot
 import pandas as pd
 import requests
-import pdfplumber
-
-try:
-    from rapidfuzz import process, fuzz
-except ImportError:
-    print("Please install rapidfuzz:")
-    print("pip install rapidfuzz")
-    sys.exit(1)
+from bs4 import BeautifulSoup
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-PDF_URL = (
-    "https://mausam.imd.gov.in/Rainfall/"
-    "DISTRICT_RAINFALL_DISTRIBUTION_COUNTRY_INDIA_cd.pdf"
+DOWNLOAD_DIR = Path("downloads")
+DOWNLOAD_DIR.mkdir(exist_ok=True)
+
+# ------------------------------------------------------------
+# Master CSV
+# Must contain:
+# State, District, Lat, Lon
+# ------------------------------------------------------------
+
+MASTER_CSV = Path("master.csv")
+
+
+# ============================================================
+# IMD URLS
+# ============================================================
+
+BASE_URL = "https://mausam.imd.gov.in"
+
+STATE_PDF_URL = (
+    BASE_URL
+    + "/Rainfall/STATE_RAINFALL_DISTRIBUTION_COUNTRY_INDIA_cd.pdf"
 )
 
-FUZZY_THRESHOLD = 85
+DISTRICT_PAGE = (
+    "https://mausam.imd.gov.in/"
+    "responsive/rainfall_statistics.php?PAGE=4"
+)
 
 
 # ============================================================
-# DOWNLOAD PDF
+# SPECIAL DISTRICT MATCHING
+#
+# These districts MUST be matched using
+# State + District
+#
+# All other districts will be matched using
+# District only.
 # ============================================================
 
-def download_pdf(url, output_path):
+SPECIAL_STATE_DISTRICT_MATCHES = {
 
-    print("\nDownloading IMD PDF...")
-    print(url)
+    (
+        "WEST UTTAR PRADESH",
+        "HAMIRPUR"
+    ),
 
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
+    (
+        "EAST UTTAR PRADESH",
+        "BALRAMPUR"
+    ),
 
-    response = requests.get(
-        url,
-        headers=headers,
-        timeout=120
+    (
+        "EAST UTTAR PRADESH",
+        "PRATAPGARH"
+    ),
+
+    (
+        "HIMACHAL PRADESH",
+        "BILASPUR"
+    ),
+
+    (
+        "HIMACHAL PRADESH",
+        "HAMIRPUR"
+    ),
+
+    (
+        "EAST RAJASTHAN",
+        "PRATAPGARH"
+    ),
+
+    (
+        "CHHATTISGARH",
+        "BALRAMPUR"
+    ),
+
+    (
+        "CHHATTISGARH",
+        "BILASPUR"
     )
-
-    response.raise_for_status()
-
-    with open(output_path, "wb") as f:
-        f.write(response.content)
-
-    print("PDF saved:")
-    print(output_path)
-
-    return output_path
+}
 
 
 # ============================================================
-# NORMALIZE TEXT
+# TEXT NORMALIZATION
 # ============================================================
 
 def normalize_text(value):
@@ -101,955 +107,985 @@ def normalize_text(value):
     if pd.isna(value):
         return ""
 
-    value = str(value).upper().strip()
+    value = str(value)
 
-    # Replace & with AND
-    value = value.replace("&", " AND ")
+    # Unicode normalization
+    value = unicodedata.normalize(
+        "NFKD",
+        value
+    )
 
-    # Common abbreviations
-    replacements = {
-        "DIST.": "DISTRICT",
-        "DIST": "DISTRICT",
-        "DISTS": "DISTRICTS",
-        "ST.": "SAINT",
-        "ST ": "SAINT ",
-    }
+    # Remove hidden characters
+    value = value.replace(
+        "\u200b",
+        ""
+    )
 
-    for old, new in replacements.items():
-        value = value.replace(old, new)
+    value = value.replace(
+        "\ufeff",
+        ""
+    )
+
+    # Replace non-breaking spaces
+    value = value.replace(
+        "\xa0",
+        " "
+    )
+
+    # Uppercase
+    value = value.upper().strip()
+
+    # Standardize &
+    value = value.replace(
+        "&",
+        " AND "
+    )
 
     # Remove punctuation
-    value = re.sub(r"[^A-Z0-9\s]", " ", value)
+    value = re.sub(
+        r"[^A-Z0-9\s]",
+        " ",
+        value
+    )
 
     # Remove repeated spaces
-    value = re.sub(r"\s+", " ", value).strip()
+    value = re.sub(
+        r"\s+",
+        " ",
+        value
+    ).strip()
 
     return value
 
 
 # ============================================================
-# EXTRACT DATE
+# GET PREVIOUS DATE
 # ============================================================
 
-def extract_data_date(text):
+prev = datetime.now() - timedelta(days=1)
 
-    patterns = [
-        r"DAY\s*:\s*(\d{2})-(\d{2})-(\d{4})",
-        r"DAY\s*:\s*(\d{2})/(\d{2})/(\d{4})",
-        r"DATE\s*:\s*(\d{2})-(\d{2})-(\d{4})",
-        r"DATE\s*:\s*(\d{2})/(\d{2})/(\d{4})",
-    ]
+date_str = prev.strftime(
+    "%Y%m%d"
+)
 
-    for pattern in patterns:
+date_display = prev.strftime(
+    "%Y-%m-%d"
+)
 
-        match = re.search(pattern, text, re.IGNORECASE)
 
-        if match:
-
-            dd, mm, yyyy = match.groups()
-
-            return f"{yyyy}-{mm}-{dd}"
-
-    return datetime.now().strftime("%Y-%m-%d")
+print(
+    "\nData date:",
+    date_display
+)
 
 
 # ============================================================
-# NUMBER CHECK
+# 1. DOWNLOAD STATE PDF
 # ============================================================
 
-def is_number(value):
+state_pdf_name = (
+    f"STATE_RAINFALL_{date_str}.pdf"
+)
 
-    if value == "ND":
-        return True
-
-    try:
-        float(value)
-        return True
-    except:
-        return False
+state_pdf_path = (
+    DOWNLOAD_DIR
+    / state_pdf_name
+)
 
 
-# ============================================================
-# CONVERT NUMBER
-# ============================================================
+print(
+    "\nDownloading State Rainfall PDF..."
+)
 
-def convert_number(value):
+response = requests.get(
+    STATE_PDF_URL,
+    headers={
+        "User-Agent": "Mozilla/5.0"
+    },
+    timeout=120
+)
 
-    if value is None:
-        return None
+response.raise_for_status()
 
-    if str(value).upper() == "ND":
-        return None
+with open(
+    state_pdf_path,
+    "wb"
+) as f:
 
-    try:
-        return float(value)
-    except:
-        return None
+    f.write(
+        response.content
+    )
 
 
-# ============================================================
-# PARSE RAINFALL BLOCK
-# ============================================================
-
-def parse_block(values, index):
-
-    if index >= len(values):
-        raise IndexError
-
-    actual = values[index]
-    index += 1
-
-    if index >= len(values):
-        raise IndexError
-
-    normal = values[index]
-    index += 1
-
-    # When Normal is ND,
-    # IMD does not provide departure/category
-    if normal == "ND":
-
-        return {
-            "Actual": convert_number(actual),
-            "Normal": None,
-            "Dept": None,
-            "Category": None
-        }, index
-
-    if index + 1 >= len(values):
-        raise IndexError
-
-    dept = values[index]
-    index += 1
-
-    category = values[index]
-    index += 1
-
-    return {
-        "Actual": convert_number(actual),
-        "Normal": convert_number(normal),
-        "Dept": convert_number(dept),
-        "Category": category
-    }, index
+print(
+    "State PDF saved:",
+    state_pdf_path
+)
 
 
 # ============================================================
-# FIND NAME + NUMERIC DATA
+# 2. FIND AND DOWNLOAD DISTRICT PDF
 # ============================================================
 
-def split_name_and_values(line):
+print(
+    "\nFinding latest District Rainfall PDF..."
+)
 
-    tokens = line.split()
+html_response = requests.get(
+    DISTRICT_PAGE,
+    headers={
+        "User-Agent": "Mozilla/5.0"
+    },
+    timeout=120
+)
 
-    for i, token in enumerate(tokens):
+html_response.raise_for_status()
 
-        if is_number(token):
+soup = BeautifulSoup(
+    html_response.text,
+    "html.parser"
+)
 
-            name = " ".join(tokens[:i]).strip()
+download = soup.find(
+    "a",
+    id="default-block-btn"
+)
 
-            if name:
+if download is None:
 
-                return name, tokens[i:]
+    raise RuntimeError(
+        "Could not find District PDF download link."
+    )
 
-    return None, None
+
+pdf_url = urljoin(
+    DISTRICT_PAGE,
+    download["href"]
+)
+
+
+print(
+    "District PDF URL:",
+    pdf_url
+)
+
+
+district_pdf_name = (
+    f"IMD_DISTRICT_RAINFALL_{date_str}.pdf"
+)
+
+district_pdf_path = (
+    DOWNLOAD_DIR
+    / district_pdf_name
+)
+
+
+response = requests.get(
+    pdf_url,
+    headers={
+        "User-Agent": "Mozilla/5.0"
+    },
+    timeout=120
+)
+
+response.raise_for_status()
+
+with open(
+    district_pdf_path,
+    "wb"
+) as f:
+
+    f.write(
+        response.content
+    )
+
+
+print(
+    "District PDF saved:",
+    district_pdf_path
+)
 
 
 # ============================================================
-# PARSE PDF
+# 3. CONVERT DISTRICT PDF TO CSV
 # ============================================================
 
-def parse_pdf(pdf_path):
+print(
+    "\nConverting District PDF to CSV..."
+)
 
-    rows = []
+tables = camelot.read_pdf(
 
-    current_state = None
-    data_date = None
+    str(
+        district_pdf_path
+    ),
 
-    print("\nReading PDF...")
+    pages="all",
 
-    with pdfplumber.open(pdf_path) as pdf:
+    flavor="stream"
 
-        print("Total pages:", len(pdf.pages))
+)
 
-        for page_number, page in enumerate(pdf.pages, start=1):
 
-            print(
-                f"Processing page {page_number}/{len(pdf.pages)}"
-            )
+print(
+    "Number of extracted tables:",
+    len(tables)
+)
 
-            text = page.extract_text(
-                x_tolerance=2,
-                y_tolerance=3
-            ) or ""
 
-            if not text:
-                continue
+if len(tables) == 0:
 
-            if data_date is None:
+    raise RuntimeError(
+        "Camelot did not extract any tables from the PDF."
+    )
 
-                data_date = extract_data_date(text)
 
-            lines = text.split("\n")
+# Collect all tables
+dfs = []
 
-            for raw_line in lines:
+for i, table in enumerate(
+    tables
+):
 
-                line = raw_line.strip()
+    temp_df = table.df.copy()
 
-                if not line:
-                    continue
+    print(
+        f"Table {i + 1}: "
+        f"{temp_df.shape[0]} rows x "
+        f"{temp_df.shape[1]} columns"
+    )
 
-                # Skip common headers
-                skip_words = [
-                    "INDIA METEOROLOGICAL DEPARTMENT",
-                    "HYDROMET DIVISION",
-                    "DISTRICT RAINFALL DISTRIBUTION",
-                    "DAY:",
-                    "S.NO",
-                    "LEGEND",
-                    "CATEGORY",
-                    "NOTE :",
-                    "LARGE EXCESS",
-                    "EXCESS",
-                    "NORMAL",
-                    "DEFICIENT",
-                    "LARGE DEFICIENT",
-                    "NO RAIN",
-                    "NOT AVAILABLE"
-                ]
+    dfs.append(
+        temp_df
+    )
 
-                if any(
-                    line.upper().startswith(word)
-                    for word in skip_words
-                ):
-                    continue
 
-                # ==================================================
-                # DISTRICT ROW
-                # ==================================================
+# Combine all tables
+converted_df = pd.concat(
+    dfs,
+    ignore_index=True
+)
 
-                match = re.match(
-                    r"^(\d+)\s+(.*)$",
-                    line
-                )
 
-                if match:
+# Save converted CSV
+converted_csv_name = (
+    f"IMD_DISTRICT_RAINFALL_{date_str}.csv"
+)
 
-                    serial_number = match.group(1)
+converted_csv_path = (
+    DOWNLOAD_DIR
+    / converted_csv_name
+)
 
-                    rest = match.group(2)
 
-                    name, values = (
-                        split_name_and_values(rest)
-                    )
+converted_df.to_csv(
 
-                    if not name:
-                        continue
+    converted_csv_path,
 
-                    if not values:
-                        continue
+    index=False
 
-                    try:
+)
 
-                        daily, index = parse_block(
-                            values,
-                            0
-                        )
 
-                        cumulative, _ = parse_block(
-                            values,
-                            index
-                        )
+print(
+    "\nConverted CSV saved:",
+    converted_csv_path
+)
 
-                    except Exception:
+print(
+    "Converted CSV rows:",
+    len(converted_df)
+)
 
-                        continue
 
-                    if current_state is None:
-                        current_state = ""
+# ============================================================
+# 4. READ MASTER CSV
+# ============================================================
 
-                    rows.append({
+print(
+    "\nReading master CSV..."
+)
 
-                        "State":
-                            current_state,
+master = pd.read_csv(
+    MASTER_CSV,
+    dtype=str
+)
 
-                        "District":
-                            name,
 
-                        "Actual":
-                            daily["Actual"],
+required_columns = [
 
-                        "Normal":
-                            daily["Normal"],
+    "State",
 
-                        "Dept":
-                            daily["Dept"],
+    "District",
 
-                        "Category":
-                            daily["Category"],
+    "Lat",
 
-                        "Cumulative_Actual":
-                            cumulative["Actual"],
+    "Lon"
 
-                        "Cumulative_Normal":
-                            cumulative["Normal"],
+]
 
-                        "Cumulative_Dept":
-                            cumulative["Dept"],
 
-                        "Cumulative_Category":
-                            cumulative["Category"],
+missing_columns = [
 
-                        "Source_Page":
-                            page_number,
+    col
 
-                        "SNo":
-                            serial_number,
+    for col in required_columns
 
-                        "Data_Date":
-                            data_date
+    if col not in master.columns
 
-                    })
+]
 
-                    continue
 
-                # ==================================================
-                # STATE ROW
-                # ==================================================
+if missing_columns:
 
-                name, values = (
-                    split_name_and_values(line)
-                )
+    raise ValueError(
 
-                if not name:
-                    continue
+        "Master CSV is missing columns: "
 
-                if not values:
-                    continue
-
-                try:
-
-                    daily, index = parse_block(
-                        values,
-                        0
-                    )
-
-                    cumulative, _ = parse_block(
-                        values,
-                        index
-                    )
-
-                except Exception:
-
-                    continue
-
-                # A line with rainfall values and no S.No
-                # is treated as a state/subdivision heading
-
-                current_state = name
-
-    df = pd.DataFrame(rows)
-
-    if df.empty:
-
-        raise RuntimeError(
-            "No district rainfall data was extracted from PDF."
+        + str(
+            missing_columns
         )
 
-    # Remove possible duplicate records
-    df = df.drop_duplicates(
-        subset=[
-            "State",
-            "District"
-        ],
-        keep="last"
-    )
-
-    print(
-        f"\nExtracted {len(df)} records from PDF."
-    )
-
-    return data_date, df
-
-
-# ============================================================
-# CREATE STATE + DISTRICT KEY
-# ============================================================
-
-def create_key(state, district):
-
-    return (
-        normalize_text(state)
-        + "|||"
-        + normalize_text(district)
     )
 
 
+print(
+    "Master rows:",
+    len(master)
+)
+
+
 # ============================================================
-# FUZZY MATCH
+# 5. IDENTIFY COLUMN STRUCTURE
 # ============================================================
 
-def fuzzy_match(
-    master_state,
-    master_district,
-    converted_df
+print(
+    "\nConverted CSV column count:",
+    len(
+        converted_df.columns
+    )
+)
+
+print(
+    "Converted CSV columns:"
+)
+
+for i, col in enumerate(
+    converted_df.columns
 ):
 
-    state_norm = normalize_text(
-        master_state
-    )
-
-    district_norm = normalize_text(
-        master_district
-    )
-
-    # First restrict to same state
-    state_rows = converted_df[
-        converted_df["_State_Normalized"]
-        == state_norm
-    ]
-
-    if state_rows.empty:
-
-        return None, 0
-
-    choices = (
-        state_rows["_District_Normalized"]
-        .dropna()
-        .unique()
-        .tolist()
-    )
-
-    if not choices:
-
-        return None, 0
-
-    result = process.extractOne(
-        district_norm,
-        choices,
-        scorer=fuzz.token_sort_ratio
-    )
-
-    if result is None:
-
-        return None, 0
-
-    matched_name = result[0]
-
-    score = result[1]
-
-    if score >= FUZZY_THRESHOLD:
-
-        return matched_name, score
-
-    return None, score
-
-
-# ============================================================
-# MERGE WITH MASTER
-# ============================================================
-
-def merge_with_master(
-    master_csv,
-    converted_csv,
-    output_csv,
-    unmatched_csv
-):
-
-    print("\nReading master CSV...")
-
-    master = pd.read_csv(
-        master_csv,
-        dtype=str
-    )
-
     print(
-        "Master records:",
-        len(master)
-    )
-
-    required_columns = [
-        "State",
-        "District",
-        "Lat",
-        "Lon"
-    ]
-
-    missing = [
+        i,
+        "->",
         col
-        for col in required_columns
-        if col not in master.columns
+    )
+
+
+# ============================================================
+# IMPORTANT:
+#
+# Camelot with stream flavor often creates columns like:
+#
+# 0, 1, 2, 3, 4, 5...
+#
+# We need to identify the district name column.
+#
+# The following code assumes:
+#
+# Column 0 = S.No
+# Column 1 = State/Subdivision/District name
+#
+# If your converted CSV has a different structure,
+# change NAME_COLUMN below.
+# ============================================================
+
+NAME_COLUMN = 1
+
+
+# ============================================================
+# 6. PREPARE CONVERTED CSV
+# ============================================================
+
+rainfall = converted_df.copy()
+
+
+# Convert all values to string
+rainfall = rainfall.astype(
+    str
+)
+
+
+# Create normalized district/name field
+rainfall[
+    "Name_Normalized"
+] = (
+
+    rainfall[
+        NAME_COLUMN
     ]
 
-    if missing:
-
-        raise ValueError(
-            f"Master CSV missing columns: {missing}"
-        )
-
-    print("\nReading converted CSV...")
-
-    rainfall = pd.read_csv(
-        converted_csv,
-        dtype=str
+    .apply(
+        normalize_text
     )
 
-    print(
-        "Converted rainfall records:",
-        len(rainfall)
+)
+
+
+# ============================================================
+# 7. EXTRACT STATE/SUBDIVISION FROM CONVERTED CSV
+# ============================================================
+
+# This section attempts to track the State/Subdivision
+# from the rows in the converted CSV.
+#
+# It is useful for the eight special cases.
+#
+# If the converted CSV contains state names as separate
+# heading rows, they will be assigned to following districts.
+
+current_state = ""
+
+
+# Get normalized special states
+special_states = set(
+
+    state
+
+    for state, district
+
+    in SPECIAL_STATE_DISTRICT_MATCHES
+
+)
+
+
+rainfall[
+    "Detected_State"
+] = ""
+
+
+for index in rainfall.index:
+
+    name = rainfall.loc[
+        index,
+        "Name_Normalized"
+    ]
+
+    # If this row looks like one of the known states
+    if name in special_states:
+
+        current_state = name
+
+        rainfall.loc[
+            index,
+            "Detected_State"
+        ] = current_state
+
+    else:
+
+        rainfall.loc[
+            index,
+            "Detected_State"
+        ] = current_state
+
+
+# ============================================================
+# 8. PREPARE MASTER NORMALIZED FIELDS
+# ============================================================
+
+master[
+    "State_Normalized"
+] = (
+
+    master[
+        "State"
+    ]
+
+    .apply(
+        normalize_text
     )
 
-    # Normalize fields
-    master["_State_Normalized"] = (
-        master["State"]
-        .apply(normalize_text)
+)
+
+
+master[
+    "District_Normalized"
+] = (
+
+    master[
+        "District"
+    ]
+
+    .apply(
+        normalize_text
     )
 
-    master["_District_Normalized"] = (
-        master["District"]
-        .apply(normalize_text)
+)
+
+
+# ============================================================
+# 9. FIND DISTRICT NAME COLUMN
+# ============================================================
+
+# The converted CSV name column is NAME_COLUMN.
+#
+# Create normalized district column.
+
+rainfall[
+    "District_Normalized"
+] = (
+
+    rainfall[
+        NAME_COLUMN
+    ]
+
+    .apply(
+        normalize_text
     )
 
-    rainfall["_State_Normalized"] = (
-        rainfall["State"]
-        .apply(normalize_text)
-    )
+)
 
-    rainfall["_District_Normalized"] = (
-        rainfall["District"]
-        .apply(normalize_text)
-    )
 
-    # ========================================================
-    # EXACT MATCH
-    # ========================================================
+# ============================================================
+# 10. CREATE RESULT
+# ============================================================
 
-    rainfall["Match_Key"] = (
-        rainfall["_State_Normalized"]
-        + "|||"
-        + rainfall["_District_Normalized"]
-    )
+result = master.copy()
 
-    master["Match_Key"] = (
-        master["_State_Normalized"]
-        + "|||"
-        + master["_District_Normalized"]
-    )
 
-    # Remove duplicate rainfall keys
-    rainfall_lookup = (
-        rainfall
-        .drop_duplicates(
-            subset=["Match_Key"],
-            keep="last"
-        )
-        .set_index("Match_Key")
-    )
+# Columns from converted CSV
+# will be appended with prefix "IMD_"
 
-    rainfall_columns = [
+imd_columns = [
 
-        "Actual",
-        "Normal",
-        "Dept",
-        "Category",
+    col
 
-        "Cumulative_Actual",
-        "Cumulative_Normal",
-        "Cumulative_Dept",
-        "Cumulative_Category",
+    for col in rainfall.columns
 
-        "Source_Page",
-        "SNo",
-        "Data_Date"
+    if col not in [
+
+        "Name_Normalized",
+
+        "Detected_State",
+
+        "District_Normalized"
 
     ]
 
+]
+
+
+for col in imd_columns:
+
+    result[
+        "IMD_" + str(col)
+    ] = None
+
+
+result[
+    "Match_Type"
+] = "UNMATCHED"
+
+
+result[
+    "Match_Score"
+] = None
+
+
+result[
+    "Matched_IMD_District"
+] = None
+
+
+result[
+    "Matched_IMD_State"
+] = None
+
+
+# ============================================================
+# 11. MATCH MASTER WITH CONVERTED CSV
+# ============================================================
+
+print(
+    "\nStarting district matching..."
+)
+
+
+for master_index in result.index:
+
+    master_state = (
+        result.loc[
+            master_index,
+            "State_Normalized"
+        ]
+    )
+
+    master_district = (
+        result.loc[
+            master_index,
+            "District_Normalized"
+        ]
+    )
+
+
     # ========================================================
-    # EXACT MERGE
+    # CHECK WHETHER THIS IS ONE OF THE SPECIAL CASES
     # ========================================================
 
-    result = master.copy()
+    special_key = (
 
-    for column in rainfall_columns:
+        master_state,
 
-        if column in rainfall_lookup.columns:
+        master_district
 
-            result[column] = (
-                result["Match_Key"]
-                .map(
-                    rainfall_lookup[column]
-                )
+    )
+
+
+    if special_key in SPECIAL_STATE_DISTRICT_MATCHES:
+
+        # ----------------------------------------------------
+        # SPECIAL CASE
+        #
+        # Match State + District
+        # ----------------------------------------------------
+
+        matches = rainfall[
+
+            (
+                rainfall[
+                    "Detected_State"
+                ]
+                == master_state
             )
 
-        else:
+            &
 
-            result[column] = None
+            (
+                rainfall[
+                    "District_Normalized"
+                ]
+                == master_district
+            )
 
-    result["Match_Type"] = ""
-
-    result["Match_Score"] = None
-
-    exact_mask = (
-        result["Actual"].notna()
-        | result["Normal"].notna()
-        | result["Category"].notna()
-    )
-
-    result.loc[
-        exact_mask,
-        "Match_Type"
-    ] = "EXACT"
-
-    result.loc[
-        exact_mask,
-        "Match_Score"
-    ] = 100
-
-    # ========================================================
-    # FUZZY MATCH UNMATCHED
-    # ========================================================
-
-    unmatched_indices = result[
-        ~exact_mask
-    ].index
-
-    print(
-        "\nExact matches:",
-        exact_mask.sum()
-    )
-
-    print(
-        "Unmatched before fuzzy matching:",
-        len(unmatched_indices)
-    )
-
-    for index in unmatched_indices:
-
-        master_state = result.loc[
-            index,
-            "State"
         ]
 
-        master_district = result.loc[
-            index,
-            "District"
-        ]
-
-        matched_district, score = fuzzy_match(
-
-            master_state,
-
-            master_district,
-
-            rainfall
-
+        match_type = (
+            "STATE_DISTRICT"
         )
 
-        if matched_district is None:
 
-            continue
+    else:
 
-        state_norm = normalize_text(
+        # ----------------------------------------------------
+        # NORMAL CASE
+        #
+        # Match District ONLY
+        # ----------------------------------------------------
+
+        matches = rainfall[
+
+            rainfall[
+                "District_Normalized"
+            ]
+
+            == master_district
+
+        ]
+
+        match_type = (
+            "DISTRICT_ONLY"
+        )
+
+
+    # ========================================================
+    # NO MATCH
+    # ========================================================
+
+    if len(matches) == 0:
+
+        continue
+
+
+    # ========================================================
+    # MULTIPLE MATCHES
+    # ========================================================
+
+    if len(matches) > 1:
+
+        print(
+            "\nWARNING: Multiple matches found"
+        )
+
+        print(
+            "Master State:",
             master_state
         )
 
-        match_rows = rainfall[
-            (
-                rainfall["_State_Normalized"]
-                == state_norm
-            )
-            &
-            (
-                rainfall["_District_Normalized"]
-                == matched_district
-            )
-        ]
-
-        if match_rows.empty:
-
-            continue
-
-        matched_row = match_rows.iloc[0]
-
-        for column in rainfall_columns:
-
-            if column in matched_row:
-
-                result.loc[
-                    index,
-                    column
-                ] = matched_row[column]
-
-        result.loc[
-            index,
-            "Match_Type"
-        ] = "FUZZY"
-
-        result.loc[
-            index,
-            "Match_Score"
-        ] = round(
-            score,
-            2
+        print(
+            "Master District:",
+            master_district
         )
 
+        print(
+            "Number of matches:",
+            len(matches)
+        )
+
+
+    # Take first matching record
+    matched_row = matches.iloc[0]
+
+
     # ========================================================
-    # FINAL STATUS
+    # COPY IMD DATA
     # ========================================================
 
-    final_matched = (
-        result["Match_Type"]
-        != ""
-    )
+    for col in imd_columns:
+
+        result.loc[
+
+            master_index,
+
+            "IMD_" + str(col)
+
+        ] = matched_row[col]
+
+
+    # ========================================================
+    # MATCH INFORMATION
+    # ========================================================
 
     result.loc[
-        ~final_matched,
+        master_index,
         "Match_Type"
-    ] = "UNMATCHED"
+    ] = match_type
 
-    # ========================================================
-    # REMOVE INTERNAL COLUMNS
-    # ========================================================
 
-    internal_columns = [
+    result.loc[
+        master_index,
+        "Match_Score"
+    ] = 100
 
-        "_State_Normalized",
-        "_District_Normalized",
-        "Match_Key"
 
+    result.loc[
+        master_index,
+        "Matched_IMD_District"
+    ] = matched_row[
+        NAME_COLUMN
     ]
 
-    result = result.drop(
-        columns=internal_columns,
-        errors="ignore"
-    )
 
-    # ========================================================
-    # SAVE FINAL MASTER
-    # ========================================================
-
-    result.to_csv(
-        output_csv,
-        index=False
-    )
-
-    print(
-        "\nFinal master CSV saved:"
-    )
-
-    print(
-        output_csv
-    )
-
-    print(
-        "\nMatch summary:"
-    )
-
-    print(
-        result["Match_Type"]
-        .value_counts()
-    )
-
-    # ========================================================
-    # SAVE UNMATCHED
-    # ========================================================
-
-    unmatched = result[
-        result["Match_Type"]
-        == "UNMATCHED"
-    ].copy()
-
-    unmatched.to_csv(
-        unmatched_csv,
-        index=False
-    )
-
-    print(
-        "\nUnmatched CSV saved:"
-    )
-
-    print(
-        unmatched_csv
-    )
-
-    return result
+    result.loc[
+        master_index,
+        "Matched_IMD_State"
+    ] = matched_row[
+        "Detected_State"
+    ]
 
 
 # ============================================================
-# MAIN
+# 12. SAVE FINAL MASTER CSV
 # ============================================================
 
-def main():
+master_output_name = (
 
-    parser = argparse.ArgumentParser()
+    f"IMD_MASTER_RAINFALL_{date_str}.csv"
 
-    parser.add_argument(
-        "--main-csv",
-        required=True,
-        help="Master CSV containing State, District, Lat, Lon"
-    )
+)
 
-    parser.add_argument(
-        "--out-dir",
-        default="output",
-        help="Output directory"
-    )
 
-    args = parser.parse_args()
+master_output_path = (
 
-    os.makedirs(
-        args.out_dir,
-        exist_ok=True
-    )
+    DOWNLOAD_DIR
 
-    # ========================================================
-    # STEP 1: TEMP PDF
-    # ========================================================
+    / master_output_name
 
-    temp_pdf = os.path.join(
-        args.out_dir,
-        "imd_rainfall_latest.pdf"
-    )
+)
 
-    # ========================================================
-    # STEP 2: DOWNLOAD PDF
-    # ========================================================
 
-    download_pdf(
-        PDF_URL,
-        temp_pdf
-    )
+# Remove internal columns
+result = result.drop(
 
-    # ========================================================
-    # STEP 3: PARSE PDF
-    # ========================================================
+    columns=[
 
-    data_date, rainfall_df = parse_pdf(
-        temp_pdf
-    )
+        "State_Normalized",
 
-    print(
-        "\nIMD data date:",
-        data_date
-    )
+        "District_Normalized"
 
-    # ========================================================
-    # STEP 4: SAVE CONVERTED CSV
-    # ========================================================
+    ],
 
-    converted_csv = os.path.join(
+    errors="ignore"
 
-        args.out_dir,
+)
 
-        f"IMD_Rainfall_Converted_{data_date}.csv"
 
-    )
+result.to_csv(
 
-    rainfall_df.to_csv(
-        converted_csv,
-        index=False
-    )
+    master_output_path,
 
-    print(
-        "\nConverted CSV saved:"
-    )
+    index=False
 
-    print(
-        converted_csv
-    )
+)
 
-    # ========================================================
-    # STEP 5: FINAL MASTER CSV
-    # ========================================================
 
-    master_output = os.path.join(
+print(
+    "\nFinal Master CSV saved:"
+)
 
-        args.out_dir,
-
-        f"IMD_Rainfall_Master_{data_date}.csv"
-
-    )
-
-    # ========================================================
-    # STEP 6: UNMATCHED CSV
-    # ========================================================
-
-    unmatched_output = os.path.join(
-
-        args.out_dir,
-
-        f"IMD_Rainfall_Unmatched_{data_date}.csv"
-
-    )
-
-    # ========================================================
-    # STEP 7: MERGE
-    # ========================================================
-
-    merge_with_master(
-
-        master_csv=args.main_csv,
-
-        converted_csv=converted_csv,
-
-        output_csv=master_output,
-
-        unmatched_csv=unmatched_output
-
-    )
-
-    print(
-        "\n======================================"
-    )
-
-    print(
-        "PROCESS COMPLETED SUCCESSFULLY"
-    )
-
-    print(
-        "======================================"
-    )
-
-    print(
-        "\nFiles created:"
-    )
-
-    print(
-        "1. PDF:"
-    )
-
-    print(
-        temp_pdf
-    )
-
-    print(
-        "\n2. Converted CSV:"
-    )
-
-    print(
-        converted_csv
-    )
-
-    print(
-        "\n3. Final Master CSV:"
-    )
-
-    print(
-        master_output
-    )
-
-    print(
-        "\n4. Unmatched CSV:"
-    )
-
-    print(
-        unmatched_output
-    )
+print(
+    master_output_path
+)
 
 
 # ============================================================
-# RUN
+# 13. SAVE UNMATCHED RECORDS
 # ============================================================
 
-if __name__ == "__main__":
+unmatched = result[
 
-    main()
+    result[
+        "Match_Type"
+    ]
+
+    == "UNMATCHED"
+
+].copy()
+
+
+unmatched_output_path = (
+
+    DOWNLOAD_DIR
+
+    / f"IMD_MASTER_UNMATCHED_{date_str}.csv"
+
+)
+
+
+unmatched.to_csv(
+
+    unmatched_output_path,
+
+    index=False
+
+)
+
+
+print(
+    "\nUnmatched CSV saved:"
+)
+
+print(
+    unmatched_output_path
+)
+
+
+# ============================================================
+# 14. SAVE MATCH SUMMARY
+# ============================================================
+
+print(
+    "\n======================================"
+)
+
+print(
+    "MATCH SUMMARY"
+)
+
+print(
+    "======================================"
+)
+
+
+print(
+
+    result[
+        "Match_Type"
+    ]
+
+    .value_counts()
+
+)
+
+
+print(
+    "\nTotal Master Records:",
+    len(result)
+)
+
+
+print(
+    "Matched Records:",
+    len(result)
+    - len(unmatched)
+)
+
+
+print(
+    "Unmatched Records:",
+    len(unmatched)
+)
+
+
+# ============================================================
+# 15. PRINT UNMATCHED DISTRICTS
+# ============================================================
+
+if len(unmatched) > 0:
+
+    print(
+        "\nUNMATCHED DISTRICTS:"
+    )
+
+    for _, row in unmatched.iterrows():
+
+        print(
+
+            row["State"],
+
+            "|",
+
+            row["District"]
+
+        )
+
+
+print(
+    "\n======================================"
+)
+
+print(
+    "PROCESS COMPLETED"
+)
+
+print(
+    "======================================"
+
+)
+
+print(
+    "\nGenerated files:"
+)
+
+print(
+    "1.",
+    state_pdf_path
+)
+
+print(
+    "2.",
+    district_pdf_path
+)
+
+print(
+    "3.",
+    converted_csv_path
+)
+
+print(
+    "4.",
+    master_output_path
+)
+
+print(
+    "5.",
+    unmatched_output_path
+)
