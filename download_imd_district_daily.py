@@ -686,15 +686,18 @@ def main():
         'ACTUAL_2', 'NORMAL_2', 'PCTDEP_2', 'CAT_2', 'match_type', 'match_score'
     ]].rename(columns={'DISTRICT_DISPLAY': 'DISTRICT'})
 
-    csv_name1 = (f"District_RAINFALL_Matser_{date_str}.csv")    
+
+    # Full CSV path for match
+    csv_name_match = (f"District_RAINFALL_Matser_Match_{date_str}.csv")    
+    OUTPUT_CSV_match = (DOWNLOAD_DIR /csv_name_match)
+
+    csv_name_mis = (f"District_RAINFALL_Matser_Mismatch_{date_str}.csv")    
+    OUTPUT_CSV_mis = (DOWNLOAD_DIR /csv_name_mis)
     
-    # Full CSV path
-    
-    OUTPUT_CSV1 = (DOWNLOAD_DIR /csv_name1)
     
 
-    final.to_csv(OUTPUT_CSV1, index=False, encoding="utf-8-sig")
-    unmatched.to_csv(OUTPUT_CSV1, index=False, encoding="utf-8-sig")
+    final.to_csv(OUTPUT_CSV_match, index=False, encoding="utf-8-sig")
+    unmatched.to_csv(OUTPUT_CSV_mis, index=False, encoding="utf-8-sig")
 
     print(f"Total district rows parsed: {len(df)}")
     print(f"Matched (exact+fuzzy): {len(matched)}")
