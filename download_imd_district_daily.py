@@ -6,6 +6,95 @@ from pathlib import Path
 import pandas as pd
 import re
 
+from pathlib import Path
+from datetime import datetime, timedelta
+import argparse
+import pandas as pd
+import re
+
+
+# ============================================================
+# COMMAND LINE ARGUMENTS
+# ============================================================
+
+parser = argparse.ArgumentParser()
+
+parser.add_argument(
+    "--main-csv",
+    required=True,
+    help="Path to master CSV"
+)
+
+parser.add_argument(
+    "--out-dir",
+    required=True,
+    help="Output directory"
+)
+
+args = parser.parse_args()
+
+
+# ============================================================
+# OUTPUT DIRECTORY
+# ============================================================
+
+DOWNLOAD_DIR = Path(
+    args.out_dir
+)
+
+DOWNLOAD_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+
+# ============================================================
+# DATE
+# ============================================================
+
+prev = datetime.now() - timedelta(
+    days=1
+)
+
+date_str = prev.strftime(
+    "%Y%m%d"
+)
+
+
+# ============================================================
+# MASTER CSV
+# ============================================================
+
+MASTER_FILE = Path(
+    args.main_csv
+)
+
+
+# ============================================================
+# OUTPUT MASTER FILE
+# ============================================================
+
+MASTER_OUTPUT = (
+
+    DOWNLOAD_DIR /
+
+    f"master_updated_{date_str}.csv"
+
+)
+
+
+# ============================================================
+# DISTRICT CSV
+# ============================================================
+
+DISTRICT_CSV = (
+
+    DOWNLOAD_DIR /
+
+    f"IMD_DISTRICT_RAINFALL_{date_str}.csv"
+
+)
+
 
 # ============================================================
 # MASTER CSV
