@@ -30,10 +30,67 @@ jobs:
       - name: Run IMD rainfall update script
         run: python download_imd_district_daily.py --main-csv master.csv --out-dir output
 
-      - name: Commit and push output
+      - name: Commit Downloaded Files
         run: |
+      
+          echo "=========================================="
+          echo "CONFIGURE GIT"
+          echo "=========================================="
+      
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add output/
-          git commit -m "Daily IMD rainfall update $(date +'%Y-%m-%d')" || echo "No changes to commit"
-          git push
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      
+      
+          echo "=========================================="
+          echo "CURRENT GIT STATUS"
+          echo "=========================================="
+      
+          git status --short
+      
+      
+          echo "=========================================="
+          echo "ADD DOWNLOAD FILES"
+          echo "=========================================="
+      
+          git add downloads/
+      
+      
+          echo "=========================================="
+          echo "STAGED FILES"
+          echo "=========================================="
+      
+          git status --short
+      
+      
+          if git diff --cached --quiet; then
+            echo "No new files to commit."
+            exit 0
+          fi
+      
+      
+          echo "=========================================="
+          echo "COMMIT FILES"
+          echo "=========================================="
+      
+          git commit -m "Daily IMD Update $(date +'%Y-%m-%d')"
+      
+      
+          echo "=========================================="
+          echo "GET LATEST REMOTE CHANGES"
+          echo "=========================================="
+      
+          git fetch origin main
+      
+      
+          echo "=========================================="
+          echo "REBASE LOCAL COMMIT ON LATEST MAIN"
+          echo "=========================================="
+      
+          git rebase origin/main
+      
+      
+          echo "=========================================="
+          echo "PUSH TO GITHUB"
+          echo "=========================================="
+      
+          git push origin HEAD:main
