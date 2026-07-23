@@ -110,7 +110,7 @@ msg = EmailMessage()
 
 msg["Subject"] = (
 
-    f"IMD Daily Rainfall Data - "
+    f"IMD Daily Rainfall Data Master- "
     f"{date_display}"
 
 )
