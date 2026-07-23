@@ -72,9 +72,9 @@ dfs = [t.df for t in tables]
 
 df = pd.concat(dfs, ignore_index=True)
 
-csv_name = f"IMD_DISTRICT_RAINFALL_{date_str}.csv"
+csv_name_district = f"IMD_DISTRICT_RAINFALL_{date_str}.csv"
 
-df.to_csv(DOWNLOAD_DIR / csv_name, index=False)
+df.to_csv(DOWNLOAD_DIR / csv_name_district, index=False)
 
 print("CSV Saved")
 
@@ -500,7 +500,7 @@ print(
 import csv, re
 import pandas as pd
 
-RAIN_PATH = OUTPUT_CSV
+RAIN_PATH = DOWNLOAD_DIR / csv_name_district
 MASTER_PATH = "master.csv"
 
 # ---------- Helpers ----------
