@@ -500,7 +500,7 @@ print(
 import csv, re
 import pandas as pd
 
-RAIN_PATH = df
+RAIN_PATH = OUTPUT_CSV
 MASTER_PATH = "master.csv"
 
 # ---------- Helpers ----------
@@ -686,8 +686,15 @@ def main():
         'ACTUAL_2', 'NORMAL_2', 'PCTDEP_2', 'CAT_2', 'match_type', 'match_score'
     ]].rename(columns={'DISTRICT_DISPLAY': 'DISTRICT'})
 
-    final.to_csv("C:/Users/mayur/Downloads/rainfall_matched.csv", index=False)
-    unmatched.to_csv("C:/Users/mayur/Downloads/rainfall_unmatched_for_review.csv", index=False)
+    csv_name1 = (f"District_RAINFALL_Matser_{date_str}.csv")    
+    
+    # Full CSV path
+    
+    OUTPUT_CSV1 = (DOWNLOAD_DIR /csv_name1)
+    
+
+    final.to_csv(OUTPUT_CSV1, index=False, encoding="utf-8-sig")
+    unmatched.to_csv(OUTPUT_CSV1, index=False, encoding="utf-8-sig")
 
     print(f"Total district rows parsed: {len(df)}")
     print(f"Matched (exact+fuzzy): {len(matched)}")
