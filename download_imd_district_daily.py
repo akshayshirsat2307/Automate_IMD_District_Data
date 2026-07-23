@@ -10,6 +10,11 @@ import re
 # ============================================================
 # MASTER CSV
 # ============================================================
+# -------------------------------
+# Output folder
+# -------------------------------
+DOWNLOAD_DIR = Path("downloads")
+DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 MASTER_FILE = Path("master.csv")
 
