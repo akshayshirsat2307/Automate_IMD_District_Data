@@ -2,95 +2,154 @@ name: IMD Daily Rainfall Update
 
 on:
   schedule:
-    # Runs at 03:30 UTC = ~09:00 AM IST daily. Adjust as needed.
+    # 03:30 UTC = 09:00 AM IST
     - cron: "30 3 * * *"
-  workflow_dispatch: {}   # allows manual trigger from the Actions tab
+
+  workflow_dispatch: {}
 
 permissions:
-  contents: write   # needed so the workflow can commit the output CSV back
+  contents: write
+
+concurrency:
+  group: imd-daily-rainfall
+  cancel-in-progress: false
 
 jobs:
+
   update:
+
     runs-on: ubuntu-latest
+
     steps:
+
+      # ==========================================
+      # CHECKOUT
+      # ==========================================
+
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+
+      # ==========================================
+      # PYTHON
+      # ==========================================
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+
+      # ==========================================
+      # DEPENDENCIES
+      # ==========================================
+
       - name: Install dependencies
-        # run: pip install requests pdfplumber pandas
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      - name: Run IMD rainfall update script
-        run: python download_imd_district_daily.py --main-csv master.csv --out-dir output
 
-      - name: Commit Downloaded Files
+      # ==========================================
+      # RUN SCRIPT
+      # ==========================================
+
+      - name: Run IMD rainfall update script
         run: |
-      
+          python download_imd_district_daily.py \
+            --main-csv master.csv \
+            --out-dir output
+
+
+      # ==========================================
+      # SHOW OUTPUT FILES
+      # ==========================================
+
+      - name: Check generated files
+        run: |
+          echo "=========================================="
+          echo "OUTPUT DIRECTORY"
+          echo "=========================================="
+
+          find output -maxdepth 2 -type f -print
+
+          echo ""
+          echo "=========================================="
+          echo "GIT STATUS BEFORE ADD"
+          echo "=========================================="
+
+          git status --short
+
+
+      # ==========================================
+      # COMMIT AND PUSH
+      # ==========================================
+
+      - name: Commit and Push Output Files
+        run: |
+
           echo "=========================================="
           echo "CONFIGURE GIT"
           echo "=========================================="
-      
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-      
-      
+
+
           echo "=========================================="
-          echo "CURRENT GIT STATUS"
+          echo "ADD OUTPUT FILES"
           echo "=========================================="
-      
-          git status --short
-      
-      
-          echo "=========================================="
-          echo "ADD DOWNLOAD FILES"
-          echo "=========================================="
-      
-          git add downloads/
-      
-      
+
+          git add output/
+
+
           echo "=========================================="
           echo "STAGED FILES"
           echo "=========================================="
-      
+
           git status --short
-      
-      
+
+
+          # ------------------------------------------
+          # Check if there is anything to commit
+          # ------------------------------------------
+
           if git diff --cached --quiet; then
-            echo "No new files to commit."
+
+            echo "No new output files to commit."
+
             exit 0
+
           fi
-      
-      
-          echo "=========================================="
-          echo "COMMIT FILES"
-          echo "=========================================="
-      
-          git commit -m "Daily IMD Update $(date +'%Y-%m-%d')"
-      
-      
-          echo "=========================================="
-          echo "GET LATEST REMOTE CHANGES"
-          echo "=========================================="
-      
+
+
+          # ------------------------------------------
+          # Commit
+          # ------------------------------------------
+
+          git commit \
+            -m "Daily IMD Rainfall Update $(date +'%Y-%m-%d')"
+
+
+          # ------------------------------------------
+          # Get latest remote changes
+          # ------------------------------------------
+
           git fetch origin main
-      
-      
-          echo "=========================================="
-          echo "REBASE LOCAL COMMIT ON LATEST MAIN"
-          echo "=========================================="
-      
+
+
+          # ------------------------------------------
+          # Rebase on latest main
+          # ------------------------------------------
+
           git rebase origin/main
-      
-      
-          echo "=========================================="
-          echo "PUSH TO GITHUB"
-          echo "=========================================="
-      
+
+
+          # ------------------------------------------
+          # Push
+          # ------------------------------------------
+
           git push origin HEAD:main
