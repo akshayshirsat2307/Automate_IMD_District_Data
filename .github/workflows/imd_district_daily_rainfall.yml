@@ -1,308 +1,445 @@
-name: IMD Daily Rainfall Update
 
-# ============================================================
-# RUN SCHEDULE 
-# ============================================================
-
-on:
-
-  schedule:
-
-    # Runs every day at 03:30 UTC
-    # = 10:00 AM IST
-    - cron: "30 4 * * *"
-
-  # Allows manual execution from GitHub Actions
-  workflow_dispatch:
-
-
-# ============================================================
-# PERMISSIONS
-# ============================================================
+name: IMD Daily Download and Email
 
 permissions:
-
   contents: write
 
+on:
+  schedule:
+    # Runs every day at 11:00 IST (01:30 UTC)
+    - cron: '30 5 * * *'
 
-# ============================================================
-# JOB
-# ============================================================
+  workflow_dispatch:
 
 jobs:
 
-  update:
+  download:
 
     runs-on: ubuntu-latest
 
-
     steps:
 
-
-      # ======================================================
-      # CHECKOUT REPOSITORY
-      # ======================================================
+      # ==========================================
+      # Checkout repository
+      # ==========================================
 
       - name: Checkout Repository
-
         uses: actions/checkout@v4
-
         with:
-
           fetch-depth: 0
-
           persist-credentials: true
 
 
-      # ======================================================
-      # SETUP PYTHON
-      # ======================================================
+      # ==========================================
+      # Setup Python
+      # ==========================================
 
       - name: Setup Python
-
         uses: actions/setup-python@v5
-
         with:
-
           python-version: "3.11"
 
 
-      # ======================================================
-      # INSTALL SYSTEM DEPENDENCIES
-      # Required by Camelot / PDF processing
-      # ======================================================
+      # ==========================================
+      # Install Linux packages required by Camelot
+      # ==========================================
 
       - name: Install System Packages
-
         run: |
-
           sudo apt-get update
-
           sudo apt-get install -y \
             ghostscript \
             python3-tk \
             libgl1
 
 
-      # ======================================================
-      # INSTALL PYTHON DEPENDENCIES
-      # ======================================================
+      # ==========================================
+      # Install Python packages
+      # ==========================================
 
       - name: Install Python Dependencies
-
         run: |
-
           python -m pip install --upgrade pip
-
           python -m pip install -r requirements.txt
 
 
-      # ======================================================
-      # SHOW REPOSITORY STRUCTURE
-      # ======================================================
+      # ==========================================
+      # Show repository structure
+      # ==========================================
 
-      - name: Show Repository Structure
-
+      - name: Show Repository Files
         run: |
-
-          echo "=========================================="
-
-          echo "CURRENT DIRECTORY"
-
-          echo "=========================================="
-
           pwd
-
-
-          echo "=========================================="
-
-          echo "REPOSITORY FILES"
-
-          echo "=========================================="
-
           ls -R
 
 
-      # ======================================================
-      # RUN IMD DAILY SCRIPT
-      #
-      # The Python script will:
-      #
-      # 1. Download State PDF
-      # 2. Download District PDF
-      # 3. Convert District PDF → CSV
-      # 4. Convert State PDF → CSV
-      # 5. Read master.csv
-      # 6. Fetch rainfall data
-      # 7. Create updated master CSV
-      # 8. Create unmatched CSV
-      #
-      # All output goes to downloads/
-      # ======================================================
+      # ==========================================
+      # Run IMD download and conversion script
+      # ==========================================
 
-      - name: Run IMD Daily Rainfall Script
-
+      - name: Run Daily Download Script
         run: |
-
-          python download_imd_district_daily.py \
-            --main-csv master.csv \
-            --out-dir downloads
+          python download_imd_district_daily.py
 
 
-      # ======================================================
-      # SHOW GENERATED FILES
-      # ======================================================
+      # ==========================================
+      # Show downloaded files
+      # ==========================================
 
-      - name: Show Generated Files
-
+      - name: Show Downloaded Files
         run: |
-
-          echo "=========================================="
-
-          echo "FILES GENERATED IN DOWNLOADS"
-
-          echo "=========================================="
-
-          find downloads -maxdepth 1 -type f -print
-
-
-          echo ""
-
-          echo "=========================================="
-
-          echo "FILE DETAILS"
-
-          echo "=========================================="
-
-
+          echo "Files available in downloads folder:"
           ls -lh downloads/
 
 
-      # ======================================================
-      # CHECK GIT STATUS
-      # ======================================================
+      # ==========================================
+      # Send Email
+      # ==========================================
 
-      - name: Check Git Status
-
+      - name: Send Daily IMD Email
+        env:
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
         run: |
-
-          echo "=========================================="
-
-          echo "GIT STATUS"
-
-          echo "=========================================="
+          python mail_daily_district_rain.py
 
 
-          git status --short
+      # ==========================================
+      # Commit newly downloaded files
+      # ==========================================
 
-
-      # ======================================================
-      # COMMIT GENERATED FILES
-      # ======================================================
-
-      - name: Commit Generated Files
-
+      - name: Commit Downloaded Files
         run: |
-
-          echo "=========================================="
-
-          echo "CONFIGURE GIT"
-
-          echo "=========================================="
-
-
-          git config user.name "github-actions[bot]"
-
-          git config user.email \
-            "41898282+github-actions[bot]@users.noreply.github.com"
-
-
-          echo "=========================================="
-
-          echo "ADD DOWNLOAD FILES"
-
-          echo "=========================================="
-
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add downloads/
 
-
-          echo "=========================================="
-
-          echo "STAGED FILES"
-
-          echo "=========================================="
-
-
-          git status --short
-
-
-          # --------------------------------------------------
-          # CHECK IF THERE ARE CHANGES
-          # --------------------------------------------------
-
           if git diff --cached --quiet; then
-
             echo "No new files to commit."
-
             exit 0
-
           fi
 
-
-          # --------------------------------------------------
-          # COMMIT
-          # --------------------------------------------------
-
-          git commit \
-            -m "Daily IMD Rainfall Update $(date +'%Y-%m-%d')"
+          git commit -m "Daily IMD Update $(date +'%Y-%m-%d')"
+          git push
 
 
-          # --------------------------------------------------
-          # GET LATEST REMOTE CHANGES
-          # --------------------------------------------------
+      # ==========================================
+      # Upload downloads as workflow artifact
+      # ==========================================
 
-          echo "Fetching latest remote changes..."
-
-
-          git fetch origin main
-
-
-          # --------------------------------------------------
-          # REBASE
-          # --------------------------------------------------
-
-          echo "Rebasing local commit..."
-
-
-          git rebase origin/main
-
-
-          # --------------------------------------------------
-          # PUSH
-          # --------------------------------------------------
-
-          echo "Pushing changes..."
-
-
-          git push origin HEAD:main
-
-
-      # ======================================================
-      # UPLOAD ARTIFACT
-      #
-      # This keeps a downloadable copy in GitHub Actions
-      # for 30 days.
-      # ======================================================
-
-      - name: Upload Daily IMD Files
-
+      - name: Upload Downloads
         uses: actions/upload-artifact@v4
-
         with:
-
-          name: IMD-Daily-Rainfall-${{ github.run_number }}
-
+          name: IMD_Downloads
           path: downloads/
-
           retention-days: 30
+
+# name: IMD Daily Rainfall Update
+
+# # ============================================================
+# # RUN SCHEDULE 
+# # ============================================================
+
+# on:
+
+#   schedule:
+
+#     # Runs every day at 03:30 UTC
+#     # = 10:00 AM IST
+#     - cron: "30 4 * * *"
+
+#   # Allows manual execution from GitHub Actions
+#   workflow_dispatch:
+
+
+# # ============================================================
+# # PERMISSIONS
+# # ============================================================
+
+# permissions:
+
+#   contents: write
+
+
+# # ============================================================
+# # JOB
+# # ============================================================
+
+# jobs:
+
+#   update:
+
+#     runs-on: ubuntu-latest
+
+
+#     steps:
+
+
+#       # ======================================================
+#       # CHECKOUT REPOSITORY
+#       # ======================================================
+
+#       - name: Checkout Repository
+
+#         uses: actions/checkout@v4
+
+#         with:
+
+#           fetch-depth: 0
+
+#           persist-credentials: true
+
+
+#       # ======================================================
+#       # SETUP PYTHON
+#       # ======================================================
+
+#       - name: Setup Python
+
+#         uses: actions/setup-python@v5
+
+#         with:
+
+#           python-version: "3.11"
+
+
+#       # ======================================================
+#       # INSTALL SYSTEM DEPENDENCIES
+#       # Required by Camelot / PDF processing
+#       # ======================================================
+
+#       - name: Install System Packages
+
+#         run: |
+
+#           sudo apt-get update
+
+#           sudo apt-get install -y \
+#             ghostscript \
+#             python3-tk \
+#             libgl1
+
+
+#       # ======================================================
+#       # INSTALL PYTHON DEPENDENCIES
+#       # ======================================================
+
+#       - name: Install Python Dependencies
+
+#         run: |
+
+#           python -m pip install --upgrade pip
+
+#           python -m pip install -r requirements.txt
+
+
+#       # ======================================================
+#       # SHOW REPOSITORY STRUCTURE
+#       # ======================================================
+
+#       - name: Show Repository Structure
+
+#         run: |
+
+#           echo "=========================================="
+
+#           echo "CURRENT DIRECTORY"
+
+#           echo "=========================================="
+
+#           pwd
+
+
+#           echo "=========================================="
+
+#           echo "REPOSITORY FILES"
+
+#           echo "=========================================="
+
+#           ls -R
+
+
+#       # ======================================================
+#       # RUN IMD DAILY SCRIPT
+#       #
+#       # The Python script will:
+#       #
+#       # 1. Download State PDF
+#       # 2. Download District PDF
+#       # 3. Convert District PDF → CSV
+#       # 4. Convert State PDF → CSV
+#       # 5. Read master.csv
+#       # 6. Fetch rainfall data
+#       # 7. Create updated master CSV
+#       # 8. Create unmatched CSV
+#       #
+#       # All output goes to downloads/
+#       # ======================================================
+
+#       - name: Run IMD Daily Rainfall Script
+
+#         run: |
+
+#           python download_imd_district_daily.py \
+#             --main-csv master.csv \
+#             --out-dir downloads
+
+
+#       # ======================================================
+#       # SHOW GENERATED FILES
+#       # ======================================================
+
+#       - name: Show Generated Files
+
+#         run: |
+
+#           echo "=========================================="
+
+#           echo "FILES GENERATED IN DOWNLOADS"
+
+#           echo "=========================================="
+
+#           find downloads -maxdepth 1 -type f -print
+
+
+#           echo ""
+
+#           echo "=========================================="
+
+#           echo "FILE DETAILS"
+
+#           echo "=========================================="
+
+
+#           ls -lh downloads/
+
+
+#       # ======================================================
+#       # CHECK GIT STATUS
+#       # ======================================================
+
+#       - name: Check Git Status
+
+#         run: |
+
+#           echo "=========================================="
+
+#           echo "GIT STATUS"
+
+#           echo "=========================================="
+
+
+#           git status --short
+
+
+#       # ======================================================
+#       # COMMIT GENERATED FILES
+#       # ======================================================
+
+#       - name: Commit Generated Files
+
+#         run: |
+
+#           echo "=========================================="
+
+#           echo "CONFIGURE GIT"
+
+#           echo "=========================================="
+
+
+#           git config user.name "github-actions[bot]"
+
+#           git config user.email \
+#             "41898282+github-actions[bot]@users.noreply.github.com"
+
+
+#           echo "=========================================="
+
+#           echo "ADD DOWNLOAD FILES"
+
+#           echo "=========================================="
+
+
+#           git add downloads/
+
+
+#           echo "=========================================="
+
+#           echo "STAGED FILES"
+
+#           echo "=========================================="
+
+
+#           git status --short
+
+
+#           # --------------------------------------------------
+#           # CHECK IF THERE ARE CHANGES
+#           # --------------------------------------------------
+
+#           if git diff --cached --quiet; then
+
+#             echo "No new files to commit."
+
+#             exit 0
+
+#           fi
+
+
+#           # --------------------------------------------------
+#           # COMMIT
+#           # --------------------------------------------------
+
+#           git commit \
+#             -m "Daily IMD Rainfall Update $(date +'%Y-%m-%d')"
+
+
+#           # --------------------------------------------------
+#           # GET LATEST REMOTE CHANGES
+#           # --------------------------------------------------
+
+#           echo "Fetching latest remote changes..."
+
+
+#           git fetch origin main
+
+
+#           # --------------------------------------------------
+#           # REBASE
+#           # --------------------------------------------------
+
+#           echo "Rebasing local commit..."
+
+
+#           git rebase origin/main
+
+
+#           # --------------------------------------------------
+#           # PUSH
+#           # --------------------------------------------------
+
+#           echo "Pushing changes..."
+
+
+#           git push origin HEAD:main
+
+
+#       # ======================================================
+#       # UPLOAD ARTIFACT
+#       #
+#       # This keeps a downloadable copy in GitHub Actions
+#       # for 30 days.
+#       # ======================================================
+
+#       - name: Upload Daily IMD Files
+
+#         uses: actions/upload-artifact@v4
+
+#         with:
+
+#           name: IMD-Daily-Rainfall-${{ github.run_number }}
+
+#           path: downloads/
+
+#           retention-days: 30
